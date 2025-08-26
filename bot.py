@@ -535,4 +535,173 @@ LOCKABLES = {"links", "media", "stickers"}
 
 @require_group_and_admin
 def cmd_lock(update: Update, context: CallbackContext):
-    if not co
+    if not context.args or context.args[0].lower() not in LOCKABLES:
+        update.effective_message.reply_text("Usage: /lock <links|media|stickers>")
+        return
+    t = context.args[0].lower()
+    chat_locks(update.effective_chat.id)[t] = True
+    save_all()
+    update.effective_message.reply_text(f"🔒 Locked {t}.")
+
+@require_group_and_admin
+def cmd_unlock(update: Update, context: CallbackContext):
+    if not context.args or context.args[0].lower() not in LOCKABLES:
+        update.effective_message.reply_text("Usage: /unlock <links|media|stickers>")
+        return
+    t = context.args[0].lower()
+    chat_locks(update.effective_chat.id)[t] = False
+    save_all()
+    update.effective_message.reply_text(f"🔓 Unlocked {t}.")
+
+def enforcement_handler(update: Update, context: CallbackContext):
+    """Deletes messages violating locks; applies anti-flood."""
+    if not is_group(update) or not update.effective_message:
+        return
+    msg = update.effective_message
+    chat_id = update.effective_chat.id
+    locks = chat_locks(chat_id)
+
+    # Lock checks
+    try:
+        # links
+        if locks.get("links"):
+            has_link = False
+            if msg.entities:
+                for ent in msg.entities:
+                    if ent.type in (MessageEntity.URL, MessageEntity.TEXT_LINK):
+                        has_link = True
+                        break
+            if has_link:
+                context.bot.delete_message(chat_id, msg.message_id)
+                return
+
+        # media
+        if locks.get("media"):
+            if msg.photo or msg.video or msg.document or msg.audio or msg.voice or msg.animation:
+                context.bot.delete_message(chat_id, msg.message_id)
+                return
+
+        # stickers
+        if locks.get("stickers") and msg.sticker:
+            context.bot.delete_message(chat_id, msg.message_id)
+            return
+    except Exception:
+        pass
+
+    # Anti-flood (simple)
+    st = chat_settings(chat_id)
+    limit = int(st.get("flood_limit", DEFAULT_FLOOD_LIMIT))
+    mute_min = int(st.get("flood_mute_min", DEFAULT_FLOOD_MUTE_MIN))
+    user_id = update.effective_user.id if update.effective_user else None
+    if not user_id:
+        return
+
+    dq = FLOOD_BUCKETS[chat_id][user_id]
+    now = time.time()
+    dq.append(now)
+    # remove timestamps older than window
+    while dq and now - dq[0] > FLOOD_WINDOW_SEC:
+        dq.popleft()
+
+    if len(dq) > limit:
+        # mute user
+        try:
+            perms = ChatPermissions(can_send_messages=False)
+            until = int(now + mute_min * 60)
+            context.bot.restrict_chat_member(chat_id, user_id, perms, until)
+            update.effective_chat.send_message(
+                f"🚫 Flood detected: muted {mention_html(update.effective_user)} for {mute_min} min.",
+                parse_mode=ParseMode.HTML,
+            )
+            dq.clear()
+        except Exception:
+            pass
+
+# ============ UTILS ============
+def whoami(update: Update, context: CallbackContext):
+    u = update.effective_user
+    update.effective_message.reply_text(f"🪪 ID: {u.id}\nName: {u.full_name}")
+
+def help_cmd(update: Update, context: CallbackContext):
+    text = (
+        "👮 Moderation:\n"
+        "/ban /unban <id> /kick\n"
+        "/mute [minutes] (reply) /unmute (reply)\n"
+        "/purge [count or reply]\n"
+        "/warn (reply) /warnings [id] /clearwarns [id] /setmaxwarns <n>\n\n"
+        "📜 Rules:\n"
+        "/setrules <text> /rules\n\n"
+        "📌 Pins:\n"
+        "/pin (reply) /unpin\n\n"
+        "🗒 Notes:\n"
+        "/save <name> <text> /get <name> /notes /delnote <name>\n\n"
+        "🔒 Locks:\n"
+        "/lock <links|media|stickers> /unlock <...>\n\n"
+        "👋 Welcome:\n"
+        "/setwelcome <text with {mention}> /welcomeon /welcomeoff\n\n"
+        "🔧 Other:\n"
+        "/whoami\n"
+    )
+    update.effective_message.reply_text(text)
+
+def error_handler(update: object, context: CallbackContext):
+    logger.error("Exception: %s", context.error)
+
+# ============ MAIN ============
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set. Configure in Render environment variables.")
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Private menu
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CallbackQueryHandler(cb_handler))
+
+    # Welcome/left
+    dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, welcome_handler))
+    dp.add_handler(MessageHandler(Filters.status_update.left_chat_member, left_handler))
+
+    # Moderation
+    dp.add_handler(CommandHandler("ban", cmd_ban))
+    dp.add_handler(CommandHandler("unban", cmd_unban))
+    dp.add_handler(CommandHandler("kick", cmd_kick))
+    dp.add_handler(CommandHandler("mute", cmd_mute))
+    dp.add_handler(CommandHandler("unmute", cmd_unmute))
+    dp.add_handler(CommandHandler("purge", cmd_purge))
+
+    # Warns
+    dp.add_handler(CommandHandler("warn", cmd_warn))
+    dp.add_handler(CommandHandler("warnings", cmd_warnings))
+    dp.add_handler(CommandHandler("clearwarns", cmd_clearwarns))
+    dp.add_handler(CommandHandler("setmaxwarns", cmd_setmaxwarns))
+
+    # Rules
+    dp.add_handler(CommandHandler("setrules", cmd_setrules))
+    dp.add_handler(CommandHandler("rules", cmd_rules))
+
+    # Pins
+    dp.add_handler(CommandHandler("pin", cmd_pin))
+    dp.add_handler(CommandHandler("unpin", cmd_unpin))
+
+    # Notes
+    dp.add_handler(CommandHandler("save", cmd_save))
+    dp.add_handler(CommandHandler("get", cmd_get))
+    dp.add_handler(CommandHandler("notes", cmd_notes))
+    dp.add_handler(CommandHandler("delnote", cmd_delnote))
+
+    # Locks + Anti-flood enforcement on every normal message
+    dp.add_handler(MessageHandler(Filters.all & ~Filters.status_update, enforcement_handler))
+
+    # Utils
+    dp.add_handler(CommandHandler("whoami", whoami))
+    dp.add_handler(CommandHandler("help", help_cmd))
+
+    dp.add_error_handler(error_handler)
+
+    logger.info("Bot starting…")
+    updater.start_polling(drop_pending_updates=True)
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
